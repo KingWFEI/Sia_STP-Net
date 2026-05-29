@@ -1,0 +1,75 @@
+seed: 42
+output_dir: run/comparison
+
+data:
+  train_dir: D:\datasets\pmtm\TBUT_Seg_Data_v1\train
+  val_dir: D:\datasets\pmtm\TBUT_Seg_Data_v1\val
+  test_dir: D:\datasets\pmtm\TBUT_Seg_Data_v1\test
+  window_size: 5
+  input_channels: 1
+  img_size: 512
+  target_idx: 2
+  use_polar: false
+
+model:
+  num_classes: 1
+  base_ch: 32
+
+training:
+  epochs: 80
+  batch_size: 2
+  accumulation_steps: 8
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-2
+  amp: true
+  num_workers: 4
+  pos_weight: 2.0
+  lambda_bce: 1.0
+  lambda_dice: 1.0
+  aux_weights: [0.4, 0.3, 0.2]
+  skip_completed: true
+
+eval:
+  threshold: 0.5
+  save_predictions: 16
+  fps_warmup: 5
+  fps_iterations: 20
+
+models:
+  unet:
+    type: static
+    display_name: U-Net
+  unetpp:
+    type: static
+    display_name: U-Net++
+  deeplabv3plus:
+    type: static
+    display_name: DeepLabV3+
+  unet3plus:
+    type: static
+    display_name: UNet 3+
+  attention_unet:
+    type: static
+    display_name: Attention U-Net
+  transunet:
+    type: static
+    display_name: TransUNet
+    base_ch: 24
+  swinunet:
+    type: static
+    display_name: Swin-Unet
+    base_ch: 24
+  2_5d_unet:
+    type: temporal
+    display_name: 2.5D U-Net
+  siamese_encoder_decoder:
+    type: temporal
+    display_name: Siamese Encoder-Decoder
+  siamese_biconvlstm:
+    type: temporal
+    display_name: Siamese + Bi-ConvLSTM
+  siamese_stpnet:
+    type: temporal
+    display_name: Siamese STP-Net
+

@@ -74,30 +74,6 @@ class SiameseEncoderWithASPP(nn.Module):
         x4 = self.aspp(self.conv4_0(self.pool(x3)))
         return [x0, x1, x2, x3, x4]
 
-
-# =========================================================================
-#  3. 时空对齐与融合 (ST_Fusion)
-# =========================================================================
-# class ConvLSTMCell(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, kernel_size, bias):
-#         super().__init__()
-#         self.input_dim = input_dim
-#         self.hidden_dim = hidden_dim
-#         self.conv = nn.Conv2d(in_channels=input_dim + hidden_dim, out_channels=4 * hidden_dim, kernel_size=kernel_size,
-#                               padding=kernel_size // 2, bias=bias)
-#
-#     def forward(self, input_tensor, cur_state):
-#         h_cur, c_cur = cur_state
-#         cc_i, cc_f, cc_o, cc_g = torch.split(self.conv(torch.cat([input_tensor, h_cur], dim=1)), self.hidden_dim, dim=1)
-#         i, f, o, g = torch.sigmoid(cc_i), torch.sigmoid(cc_f), torch.sigmoid(cc_o), torch.tanh(cc_g)
-#         c_next = f * c_cur + i * g
-#         return o * torch.tanh(c_next), c_next
-#
-#     def init_hidden(self, batch_size, image_size):
-#         h, w = image_size
-#         return (torch.zeros(batch_size, self.hidden_dim, h, w, device=self.conv.weight.device),
-#                 torch.zeros(batch_size, self.hidden_dim, h, w, device=self.conv.weight.device))
-
 class STNFeatureAligner(nn.Module):
     def __init__(self, channels):
         super().__init__()

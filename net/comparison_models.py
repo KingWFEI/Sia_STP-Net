@@ -55,6 +55,137 @@ class Sequence2DWrapper(nn.Module):
         return self.model(_as_2d_input(x, self.input_mode))
 
 
+class UNet(nn.Module):
+    def __init__(self, in_channels=1, num_classes=1, base_ch=32):
+        super().__init__()
+        f = [base_ch, base_ch * 2, base_ch * 4, base_ch * 8, base_ch * 16]
+        self.pool = nn.MaxPool2d(2, 2)
+        self.e1 = DoubleConv(in_channels, f[0])
+        self.e2 = DoubleConv(f[0], f[1])
+        self.e3 = DoubleConv(f[1], f[2])
+        self.e4 = DoubleConv(f[2], f[3])
+        self.center = DoubleConv(f[3], f[4])
+        self.up4 = nn.ConvTranspose2d(f[4], f[3], 2, 2)
+        self.d4 = DoubleConv(f[4], f[3])
+        self.up3 = nn.ConvTranspose2d(f[3], f[2], 2, 2)
+        self.d3 = DoubleConv(f[3], f[2])
+        self.up2 = nn.ConvTranspose2d(f[2], f[1], 2, 2)
+        self.d2 = DoubleConv(f[2], f[1])
+        self.up1 = nn.ConvTranspose2d(f[1], f[0], 2, 2)
+        self.d1 = DoubleConv(f[1], f[0])
+        self.final = nn.Conv2d(f[0], num_classes, 1)
+
+    @staticmethod
+    def _cat(up, skip):
+        if up.shape[-2:] != skip.shape[-2:]:
+            up = F.interpolate(up, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return torch.cat([skip, up], dim=1)
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(self.pool(e1))
+        e3 = self.e3(self.pool(e2))
+        e4 = self.e4(self.pool(e3))
+        center = self.center(self.pool(e4))
+        d4 = self.d4(self._cat(self.up4(center), e4))
+        d3 = self.d3(self._cat(self.up3(d4), e3))
+        d2 = self.d2(self._cat(self.up2(d3), e2))
+        d1 = self.d1(self._cat(self.up1(d2), e1))
+        return self.final(d1)
+
+
+class UNetPlusPlus(nn.Module):
+    def __init__(self, in_channels=1, num_classes=1, base_ch=32):
+        super().__init__()
+        nb = [base_ch, base_ch * 2, base_ch * 4, base_ch * 8, base_ch * 16]
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv0_0 = DoubleConv(in_channels, nb[0])
+        self.conv1_0 = DoubleConv(nb[0], nb[1])
+        self.conv2_0 = DoubleConv(nb[1], nb[2])
+        self.conv3_0 = DoubleConv(nb[2], nb[3])
+        self.conv4_0 = DoubleConv(nb[3], nb[4])
+
+        self.conv0_1 = DoubleConv(nb[0] + nb[1], nb[0])
+        self.conv1_1 = DoubleConv(nb[1] + nb[2], nb[1])
+        self.conv2_1 = DoubleConv(nb[2] + nb[3], nb[2])
+        self.conv3_1 = DoubleConv(nb[3] + nb[4], nb[3])
+        self.conv0_2 = DoubleConv(nb[0] * 2 + nb[1], nb[0])
+        self.conv1_2 = DoubleConv(nb[1] * 2 + nb[2], nb[1])
+        self.conv2_2 = DoubleConv(nb[2] * 2 + nb[3], nb[2])
+        self.conv0_3 = DoubleConv(nb[0] * 3 + nb[1], nb[0])
+        self.conv1_3 = DoubleConv(nb[1] * 3 + nb[2], nb[1])
+        self.conv0_4 = DoubleConv(nb[0] * 4 + nb[1], nb[0])
+        self.final = nn.Conv2d(nb[0], num_classes, 1)
+
+    @staticmethod
+    def _up(x, ref):
+        return F.interpolate(x, size=ref.shape[-2:], mode="bilinear", align_corners=False)
+
+    def forward(self, x):
+        x0_0 = self.conv0_0(x)
+        x1_0 = self.conv1_0(self.pool(x0_0))
+        x0_1 = self.conv0_1(torch.cat([x0_0, self._up(x1_0, x0_0)], dim=1))
+
+        x2_0 = self.conv2_0(self.pool(x1_0))
+        x1_1 = self.conv1_1(torch.cat([x1_0, self._up(x2_0, x1_0)], dim=1))
+        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self._up(x1_1, x0_0)], dim=1))
+
+        x3_0 = self.conv3_0(self.pool(x2_0))
+        x2_1 = self.conv2_1(torch.cat([x2_0, self._up(x3_0, x2_0)], dim=1))
+        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self._up(x2_1, x1_0)], dim=1))
+        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self._up(x1_2, x0_0)], dim=1))
+
+        x4_0 = self.conv4_0(self.pool(x3_0))
+        x3_1 = self.conv3_1(torch.cat([x3_0, self._up(x4_0, x3_0)], dim=1))
+        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self._up(x3_1, x2_0)], dim=1))
+        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self._up(x2_2, x1_0)], dim=1))
+        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self._up(x1_3, x0_0)], dim=1))
+        return self.final(x0_4)
+
+
+class DeepLabV3Plus(nn.Module):
+    def __init__(self, in_channels=1, num_classes=1, base_ch=32):
+        super().__init__()
+        self.stem = DoubleConv(in_channels, base_ch)
+        self.low = DoubleConv(base_ch, base_ch * 2)
+        self.mid = DoubleConv(base_ch * 2, base_ch * 4)
+        self.high = DoubleConv(base_ch * 4, base_ch * 8)
+        self.pool = nn.MaxPool2d(2, 2)
+        aspp_ch = base_ch * 8
+        self.aspp1 = ConvBNReLU(aspp_ch, base_ch * 2, kernel_size=1, padding=0)
+        self.aspp2 = ConvBNReLU(aspp_ch, base_ch * 2, kernel_size=3, padding=6)
+        self.aspp2.block[0].dilation = (6, 6)
+        self.aspp3 = ConvBNReLU(aspp_ch, base_ch * 2, kernel_size=3, padding=12)
+        self.aspp3.block[0].dilation = (12, 12)
+        self.aspp4 = ConvBNReLU(aspp_ch, base_ch * 2, kernel_size=3, padding=18)
+        self.aspp4.block[0].dilation = (18, 18)
+        self.image_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(aspp_ch, base_ch * 2, 1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.aspp_project = ConvBNReLU(base_ch * 10, base_ch * 4, kernel_size=1, padding=0)
+        self.low_project = ConvBNReLU(base_ch * 2, base_ch, kernel_size=1, padding=0)
+        self.decoder = nn.Sequential(
+            DoubleConv(base_ch * 5, base_ch * 2),
+            nn.Conv2d(base_ch * 2, num_classes, 1),
+        )
+
+    def forward(self, x):
+        out_size = x.shape[-2:]
+        x0 = self.stem(x)
+        low = self.low(self.pool(x0))
+        mid = self.mid(self.pool(low))
+        high = self.high(self.pool(mid))
+        pooled = F.interpolate(self.image_pool(high), size=high.shape[-2:], mode="bilinear", align_corners=False)
+        aspp = torch.cat([self.aspp1(high), self.aspp2(high), self.aspp3(high), self.aspp4(high), pooled], dim=1)
+        aspp = self.aspp_project(aspp)
+        aspp = F.interpolate(aspp, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        low = self.low_project(low)
+        out = self.decoder(torch.cat([aspp, low], dim=1))
+        return F.interpolate(out, size=out_size, mode="bilinear", align_corners=False)
+
+
 class UNet3Plus(nn.Module):
     def __init__(self, in_channels=1, num_classes=1, base_ch=32):
         super().__init__()
@@ -438,7 +569,15 @@ def build_comparison_model(
     model_key = model_name.lower().replace("-", "_")
     effective_in = input_channels if input_mode == "center" else input_channels * window_size
 
-    if model_key in {"unet3plus", "unet_3plus", "unet3+"}:
+    if model_key in {"unet", "u_net"}:
+        model = UNet(effective_in, num_classes, base_ch)
+    elif model_key in {"unetpp", "unet++", "unet_plus_plus", "nested_unet"}:
+        model = UNetPlusPlus(effective_in, num_classes, base_ch)
+    elif model_key in {"deeplabv3plus", "deeplabv3_plus", "deeplab_v3_plus"}:
+        model = DeepLabV3Plus(effective_in, num_classes, base_ch)
+    elif model_key in {"2_5d_unet", "unet_2_5d", "two5d_unet"}:
+        model = UNet(effective_in, num_classes, base_ch)
+    elif model_key in {"unet3plus", "unet_3plus", "unet3+"}:
         model = UNet3Plus(effective_in, num_classes, base_ch)
     elif model_key in {"attention_unet", "att_unet", "attentionunet"}:
         model = AttentionUNet(effective_in, num_classes, base_ch)
@@ -460,4 +599,13 @@ def build_comparison_model(
     return Sequence2DWrapper(model, input_mode=input_mode)
 
 
-COMPARISON_MODELS = ("unet3plus", "attention_unet", "transunet", "swin_unet")
+COMPARISON_MODELS = (
+    "unet",
+    "unetpp",
+    "deeplabv3plus",
+    "unet3plus",
+    "attention_unet",
+    "transunet",
+    "swin_unet",
+    "2_5d_unet",
+)
