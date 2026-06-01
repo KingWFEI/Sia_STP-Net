@@ -1,6 +1,9 @@
 import gc
 import os
 import argparse
+import json
+import math
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,16 +16,21 @@ from tqdm.auto import tqdm
 from datetime import datetime
 import csv
 
+try:
+    from scipy.ndimage import binary_erosion, distance_transform_edt
+except Exception:
+    binary_erosion = None
+    distance_transform_edt = None
+
 # from st_unet_v2 import build_model
 # from st_deeplabv3plus import build_model
 from net.sia_prompt_net_bdf import (build_model)
 from loss.loss import LabelSmoothingBCE
 
 try:
-    from utils import SequencePMTMDataset
+    from utils.utils import SequencePMTMDataset
 except ImportError:
     raise ImportError("请确保 utils.py (含SequencePMTMDataset) 和 st_unet.py 都在当前目录下。")
-
 
 def safe_collate(batch):
     batch = [b for b in batch if b is not None]
@@ -246,6 +254,438 @@ class TrainingVisualizer:
         plt.close()
 
 
+def nan_value():
+    return float("nan")
+
+
+def as_float(value, default=0.0):
+    try:
+        if torch.is_tensor(value):
+            value = value.detach().float().mean().item()
+        return float(value)
+    except Exception:
+        return default
+
+
+def fmt_metric(value, digits=4):
+    if value is None:
+        return "N/A"
+    try:
+        value = float(value)
+        if math.isnan(value):
+            return "N/A"
+        return f"{value:.{digits}f}"
+    except Exception:
+        return "N/A"
+
+
+def safe_hd95(pred_mask, target_mask):
+    pred = np.asarray(pred_mask).astype(bool)
+    target = np.asarray(target_mask).astype(bool)
+    if pred.shape != target.shape:
+        return nan_value()
+    diag = float(math.hypot(pred.shape[-2], pred.shape[-1]))
+    if not pred.any() and not target.any():
+        return 0.0
+    if pred.any() != target.any():
+        return diag
+    if binary_erosion is None or distance_transform_edt is None:
+        return nan_value()
+    try:
+        pred_surface = pred ^ binary_erosion(pred)
+        target_surface = target ^ binary_erosion(target)
+        if not pred_surface.any() or not target_surface.any():
+            return diag
+        dt_pred = distance_transform_edt(~pred_surface)
+        dt_target = distance_transform_edt(~target_surface)
+        distances = np.concatenate([dt_target[pred_surface], dt_pred[target_surface]])
+        return float(np.percentile(distances, 95)) if distances.size else 0.0
+    except Exception:
+        return nan_value()
+
+
+def compute_batch_hd95(logits, targets, threshold=0.5):
+    if logits.shape[-2:] != targets.shape[-2:]:
+        logits = F.interpolate(logits, size=targets.shape[-2:], mode="bilinear", align_corners=False)
+    preds = (torch.sigmoid(logits) > threshold).detach().cpu().numpy()
+    masks = (targets > 0.5).detach().cpu().numpy()
+    values = []
+    for pred, mask in zip(preds, masks):
+        values.append(safe_hd95(pred.squeeze(), mask.squeeze()))
+    valid = [v for v in values if not math.isnan(v)]
+    return float(np.mean(valid)) if valid else nan_value()
+
+
+def collect_output_diagnostics(outputs):
+    stats = {
+        "gate_mean": nan_value(),
+        "gate_std": nan_value(),
+        "gate_min": nan_value(),
+        "gate_max": nan_value(),
+        "prompt_norm": nan_value(),
+        "target_feat_norm": nan_value(),
+        "merged_state_norm": nan_value(),
+        "prompt_target_ratio": nan_value(),
+    }
+    if not isinstance(outputs, dict):
+        return stats
+
+    gate_maps = outputs.get("gate_maps")
+    if torch.is_tensor(gate_maps):
+        gate = gate_maps.detach().float()
+        stats["gate_mean"] = as_float(gate.mean(), nan_value())
+        stats["gate_std"] = as_float(gate.std(unbiased=False), nan_value())
+        stats["gate_min"] = as_float(gate.min(), nan_value())
+        stats["gate_max"] = as_float(gate.max(), nan_value())
+
+    prompt_norm = outputs.get("prompt_norm")
+    target_feat_norm = outputs.get("target_feat_norm")
+    merged_state_norm = outputs.get("merged_state_norm")
+
+    if prompt_norm is None:
+        prompt = outputs.get("prompt", outputs.get("temporal_prompt"))
+        if torch.is_tensor(prompt):
+            prompt_norm = torch.linalg.vector_norm(prompt.detach().float(), dim=1).mean()
+    if target_feat_norm is None:
+        target_feat = outputs.get("target_feat")
+        if torch.is_tensor(target_feat):
+            target_feat_norm = torch.linalg.vector_norm(target_feat.detach().float(), dim=1).mean()
+    if merged_state_norm is None:
+        merged_state = outputs.get("merged_state")
+        if torch.is_tensor(merged_state):
+            merged_state_norm = torch.linalg.vector_norm(merged_state.detach().float(), dim=1).mean()
+
+    stats["prompt_norm"] = as_float(prompt_norm, nan_value()) if prompt_norm is not None else nan_value()
+    stats["target_feat_norm"] = as_float(target_feat_norm, nan_value()) if target_feat_norm is not None else nan_value()
+    stats["merged_state_norm"] = as_float(merged_state_norm, nan_value()) if merged_state_norm is not None else nan_value()
+    if not math.isnan(stats["prompt_norm"]) and not math.isnan(stats["target_feat_norm"]):
+        stats["prompt_target_ratio"] = stats["prompt_norm"] / (stats["target_feat_norm"] + 1e-7)
+    return stats
+
+
+class TrainingDiagnosticsLogger:
+    def __init__(self, diagnostics_dir, args, model, device, params_m, trainable_params_m, flops_g=nan_value()):
+        self.diagnostics_dir = diagnostics_dir
+        os.makedirs(self.diagnostics_dir, exist_ok=True)
+        self.epoch_csv = os.path.join(self.diagnostics_dir, "epoch_diagnostics.csv")
+        self.eff_csv = os.path.join(self.diagnostics_dir, "efficiency_log.csv")
+        self.report_path = os.path.join(self.diagnostics_dir, "defect_report.md")
+        self.best_json = os.path.join(self.diagnostics_dir, "best_epoch_summary.json")
+        self.config_json = os.path.join(self.diagnostics_dir, "diagnostic_config.json")
+        self.rows = []
+        self.params_m = params_m
+        self.trainable_params_m = trainable_params_m
+        self.flops_g = flops_g
+        self.start_time = time.time()
+
+        self.epoch_fields = [
+            "epoch", "lr", "train_loss", "val_loss",
+            "train_dice", "val_dice", "dice_gap",
+            "train_iou", "val_iou", "iou_gap",
+            "train_precision", "val_precision", "train_recall", "val_recall",
+            "train_specificity", "val_specificity",
+            "val_fpr", "val_fnr", "val_pred_fg_ratio", "val_gt_fg_ratio", "val_pred_gt_fg_ratio",
+            "val_hd95", "epoch_time_sec", "train_time_sec", "val_time_sec", "samples_per_sec",
+            "max_gpu_memory_mb", "grad_norm",
+            "gate_mean", "gate_std", "gate_min", "gate_max",
+            "prompt_norm", "target_feat_norm", "merged_state_norm", "prompt_target_ratio",
+        ]
+        self.eff_fields = [
+            "epoch", "params_m", "trainable_params_m", "epoch_time_sec", "train_time_sec",
+            "val_time_sec", "samples_per_sec", "max_gpu_memory_mb", "current_lr", "flops_g",
+        ]
+        self._init_csv(self.epoch_csv, self.epoch_fields)
+        self._init_csv(self.eff_csv, self.eff_fields)
+        self._write_config(args, device)
+        self.log_efficiency(0, 0.0, 0.0, 0.0, 0.0, self._current_memory_mb(), args.lr)
+
+    def _init_csv(self, path, fields):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=fields).writeheader()
+
+    def _write_config(self, args, device):
+        config = {
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "device": str(device),
+            "compute_hd95": bool(args.compute_hd95),
+            "hd95_every": int(args.hd95_every),
+            "train_dir": args.train_dir,
+            "val_dir": args.val_dir,
+            "save_dir": args.save_dir,
+            "window_size": args.window_size,
+            "img_size": args.img_size,
+            "batch_size": args.batch_size,
+            "accumulation_steps": args.accumulation_steps,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "amp": bool(args.amp),
+        }
+        with open(self.config_json, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+    def _current_memory_mb(self):
+        if torch.cuda.is_available():
+            return float(torch.cuda.max_memory_allocated() / 1024 / 1024)
+        return 0.0
+
+    def log_epoch(self, epoch, lr, train_metrics, val_metrics, timing):
+        row = {
+            "epoch": epoch,
+            "lr": lr,
+            "train_loss": train_metrics.get("loss", nan_value()),
+            "val_loss": val_metrics.get("loss", nan_value()),
+            "train_dice": train_metrics.get("dice", nan_value()),
+            "val_dice": val_metrics.get("dice", nan_value()),
+            "dice_gap": train_metrics.get("dice", nan_value()) - val_metrics.get("dice", nan_value()),
+            "train_iou": train_metrics.get("iou", nan_value()),
+            "val_iou": val_metrics.get("iou", nan_value()),
+            "iou_gap": train_metrics.get("iou", nan_value()) - val_metrics.get("iou", nan_value()),
+            "train_precision": train_metrics.get("precision", nan_value()),
+            "val_precision": val_metrics.get("precision", nan_value()),
+            "train_recall": train_metrics.get("recall", nan_value()),
+            "val_recall": val_metrics.get("recall", nan_value()),
+            "train_specificity": train_metrics.get("specificity", nan_value()),
+            "val_specificity": val_metrics.get("specificity", nan_value()),
+            "val_fpr": val_metrics.get("fpr", nan_value()),
+            "val_fnr": val_metrics.get("fnr", nan_value()),
+            "val_pred_fg_ratio": val_metrics.get("pred_fg_ratio", nan_value()),
+            "val_gt_fg_ratio": val_metrics.get("gt_fg_ratio", nan_value()),
+            "val_pred_gt_fg_ratio": val_metrics.get("pred_gt_fg_ratio", nan_value()),
+            "val_hd95": val_metrics.get("hd95", nan_value()),
+            "epoch_time_sec": timing.get("epoch_time_sec", 0.0),
+            "train_time_sec": timing.get("train_time_sec", 0.0),
+            "val_time_sec": timing.get("val_time_sec", 0.0),
+            "samples_per_sec": timing.get("samples_per_sec", 0.0),
+            "max_gpu_memory_mb": timing.get("max_gpu_memory_mb", 0.0),
+            "grad_norm": train_metrics.get("grad_norm", nan_value()),
+            "gate_mean": val_metrics.get("gate_mean", nan_value()),
+            "gate_std": val_metrics.get("gate_std", nan_value()),
+            "gate_min": val_metrics.get("gate_min", nan_value()),
+            "gate_max": val_metrics.get("gate_max", nan_value()),
+            "prompt_norm": val_metrics.get("prompt_norm", nan_value()),
+            "target_feat_norm": val_metrics.get("target_feat_norm", nan_value()),
+            "merged_state_norm": val_metrics.get("merged_state_norm", nan_value()),
+            "prompt_target_ratio": val_metrics.get("prompt_target_ratio", nan_value()),
+        }
+        self.rows.append(row)
+        with open(self.epoch_csv, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.epoch_fields).writerow(row)
+        self.log_efficiency(
+            epoch, row["epoch_time_sec"], row["train_time_sec"], row["val_time_sec"],
+            row["samples_per_sec"], row["max_gpu_memory_mb"], lr
+        )
+
+    def log_efficiency(self, epoch, epoch_time, train_time, val_time, samples_per_sec, max_gpu_memory_mb, lr):
+        row = {
+            "epoch": epoch,
+            "params_m": self.params_m,
+            "trainable_params_m": self.trainable_params_m,
+            "epoch_time_sec": epoch_time,
+            "train_time_sec": train_time,
+            "val_time_sec": val_time,
+            "samples_per_sec": samples_per_sec,
+            "max_gpu_memory_mb": max_gpu_memory_mb,
+            "current_lr": lr,
+            "flops_g": self.flops_g,
+        }
+        with open(self.eff_csv, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.eff_fields).writerow(row)
+
+    def finalize(self):
+        if not self.rows:
+            return
+        generate_best_epoch_summary(self.rows, self.best_json, self.params_m)
+        generate_diagnostic_curves(self.rows, self.diagnostics_dir)
+        generate_defect_report(self.rows, self.report_path, self.params_m, self.trainable_params_m, time.time() - self.start_time)
+
+
+def generate_best_epoch_summary(rows, output_path, params_m):
+    best = max(rows, key=lambda r: r.get("val_dice", -1.0))
+    summary = {
+        "best_epoch_by_val_dice": int(best["epoch"]),
+        "best_val_dice": best.get("val_dice"),
+        "val_iou": best.get("val_iou"),
+        "val_precision": best.get("val_precision"),
+        "val_recall": best.get("val_recall"),
+        "val_specificity": best.get("val_specificity"),
+        "val_fpr": best.get("val_fpr"),
+        "val_fnr": best.get("val_fnr"),
+        "val_hd95": best.get("val_hd95"),
+        "pred_fg_ratio": best.get("val_pred_fg_ratio"),
+        "gt_fg_ratio": best.get("val_gt_fg_ratio"),
+        "pred_gt_fg_ratio": best.get("val_pred_gt_fg_ratio"),
+        "params_m": params_m,
+        "max_gpu_memory_mb": best.get("max_gpu_memory_mb"),
+        "epoch_time_sec": best.get("epoch_time_sec"),
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+
+def generate_diagnostic_curves(rows, diagnostics_dir):
+    epochs = [r["epoch"] for r in rows]
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.flatten()
+
+    axes[0].plot(epochs, [r["dice_gap"] for r in rows], label="Dice Gap")
+    axes[0].set_title("Train-Val Dice Gap")
+    axes[0].grid(True)
+
+    axes[1].plot(epochs, [r["val_precision"] for r in rows], label="Precision")
+    axes[1].plot(epochs, [r["val_recall"] for r in rows], label="Recall")
+    axes[1].set_title("Precision vs Recall")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    axes[2].plot(epochs, [r["val_fpr"] for r in rows], label="FPR")
+    axes[2].plot(epochs, [r["val_fnr"] for r in rows], label="FNR")
+    axes[2].set_title("FPR / FNR")
+    axes[2].legend()
+    axes[2].grid(True)
+
+    axes[3].plot(epochs, [r["val_pred_gt_fg_ratio"] for r in rows], label="Pred/GT")
+    axes[3].axhline(1.0, color="gray", linestyle="--")
+    axes[3].set_title("Pred/GT Foreground Ratio")
+    axes[3].grid(True)
+
+    axes[4].plot(epochs, [r["max_gpu_memory_mb"] for r in rows], label="GPU MB")
+    axes[4].set_title("GPU Memory")
+    axes[4].grid(True)
+
+    gate_mean = [r["gate_mean"] for r in rows]
+    gate_std = [r["gate_std"] for r in rows]
+    if any(not math.isnan(v) for v in gate_mean):
+        axes[5].plot(epochs, gate_mean, label="Gate Mean")
+        axes[5].plot(epochs, gate_std, label="Gate Std")
+        axes[5].legend()
+    axes[5].set_title("Gate Mean / Std")
+    axes[5].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(diagnostics_dir, "diagnostic_curves.png"))
+    plt.close()
+
+
+def generate_defect_report(rows, report_path, params_m, trainable_params_m, total_time_sec):
+    best = max(rows, key=lambda r: r.get("val_dice", -1.0))
+    last = rows[-1]
+    avg_epoch_time = float(np.mean([r["epoch_time_sec"] for r in rows]))
+    max_memory = max(r["max_gpu_memory_mb"] for r in rows)
+    hd95_values = [r["val_hd95"] for r in rows if not math.isnan(r["val_hd95"])]
+
+    suggestions = []
+    lines = ["# Training Defect Report", ""]
+    lines += [
+        "## 1. Basic Summary",
+        f"- Best Val Dice epoch: {best['epoch']}",
+        f"- Best Val Dice: {fmt_metric(best['val_dice'])}",
+        f"- Val Precision / Recall / Specificity: {fmt_metric(best['val_precision'])} / {fmt_metric(best['val_recall'])} / {fmt_metric(best['val_specificity'])}",
+        f"- Val FPR / FNR: {fmt_metric(best['val_fpr'])} / {fmt_metric(best['val_fnr'])}",
+        f"- Pred/GT foreground ratio: {fmt_metric(best['val_pred_gt_fg_ratio'])}",
+        f"- HD95: {fmt_metric(best['val_hd95'])}",
+        f"- Params / Trainable Params: {params_m:.2f}M / {trainable_params_m:.2f}M",
+        f"- Total training time: {total_time_sec / 60.0:.2f} min",
+        f"- Average epoch time: {avg_epoch_time:.2f} sec",
+        f"- Max GPU memory: {max_memory:.1f} MB",
+        "",
+    ]
+
+    gap = best["dice_gap"]
+    lines.append("## 2. Overfitting Diagnosis")
+    if gap < 0.08:
+        lines.append("训练-验证 Dice gap 较小，当前过拟合风险较低。")
+    elif gap < 0.15:
+        lines.append(f"最佳 epoch 的 Dice gap 为 {gap:.4f}，存在轻度过拟合迹象。")
+        suggestions += ["增强数据增强", "适当增大 weight decay", "继续使用 early stopping"]
+    else:
+        lines.append(f"模型在 epoch {best['epoch']} 出现明显 train-validation gap，可能存在明显过拟合。")
+        suggestions += ["增强数据增强", "降低模型容量", "检查训练集和验证集分布是否一致"]
+    lines.append("")
+
+    ratio = best["val_pred_gt_fg_ratio"]
+    precision = best["val_precision"]
+    recall = best["val_recall"]
+    fpr = best["val_fpr"]
+    fnr = best["val_fnr"]
+
+    lines.append("## 3. Over-segmentation Diagnosis")
+    if ratio > 1.3 and precision < recall:
+        lines.append("模型存在明显过分割：预测前景比例显著高于标签，且 Precision 低于 Recall。")
+        suggestions += ["增强背景约束", "增加边界约束", "尝试阈值从 0.5 调整到 0.55 或 0.6"]
+    elif 1.1 <= ratio <= 1.3:
+        lines.append("模型存在轻度过分割倾向，预测前景比例略高。")
+    elif ratio < 0.8:
+        lines.append("预测区域偏小，不是过分割主导，更可能是漏分或预测保守。")
+    else:
+        lines.append("预测前景比例较合理，未见明显过分割。")
+    lines.append(f"当前 Precision={fmt_metric(precision)}, Recall={fmt_metric(recall)}, FPR={fmt_metric(fpr)}。")
+    lines.append("")
+
+    lines.append("## 4. Under-segmentation / Missed Detection Diagnosis")
+    if recall < 0.75 and fnr > 0.25:
+        lines.append("漏检明显：Recall 偏低且 FNR 偏高。")
+        suggestions += ["降低可靠性门控抑制强度", "将 e_hat_t = r_t * e_t 改为 (0.5 + 0.5*r_t) * e_t", "增强弱边界样本"]
+    elif recall < 0.8:
+        lines.append("召回能力偏弱，模型可能漏掉部分破裂区域。")
+        suggestions += ["适当提高 Dice loss 权重", "检查 pos_weight 是否过低"]
+    else:
+        lines.append("Recall 处于相对可接受范围，漏检不是当前最突出的风险。")
+    if ratio < 0.8:
+        lines.append("Pred/GT foreground ratio < 0.8，说明预测区域偏小，模型可能过于保守。")
+    lines.append("")
+
+    lines.append("## 5. Boundary Quality Diagnosis")
+    if hd95_values:
+        if len(hd95_values) >= 2 and best["val_dice"] > rows[0]["val_dice"] and best["val_hd95"] >= rows[0]["val_hd95"]:
+            lines.append("Dice 有提升但 HD95 没有同步下降，说明区域重叠变好但边界质量没有同步改善。")
+            suggestions += ["保存边界误差最大的样本", "增加局部放大可视化", "检查 mask 标注边界质量"]
+        hd95_std = float(np.std(hd95_values))
+        lines.append(f"HD95 均值/波动: {float(np.mean(hd95_values)):.4f} / {hd95_std:.4f}。波动越大说明边界稳定性越不足。")
+        if hd95_std > max(float(np.mean(hd95_values)) * 0.3, 1e-6):
+            suggestions += ["增加边界相关指标监控", "引入边界约束或后处理"]
+    else:
+        lines.append("本次未计算 HD95。需要边界质量诊断时请加 --compute_hd95。")
+    lines.append("")
+
+    lines.append("## 6. BDF Gate Diagnosis")
+    gate_mean = best.get("gate_mean", nan_value())
+    gate_std = best.get("gate_std", nan_value())
+    if math.isnan(gate_mean):
+        lines.append("模型输出未包含 gate_maps，跳过 BDF 门控诊断。")
+    else:
+        lines.append(f"gate_mean={fmt_metric(gate_mean)}, gate_std={fmt_metric(gate_std)}。")
+        if gate_mean < 0.25:
+            lines.append("可靠性门控可能过强，真实弱边界证据可能被压制，容易导致 Recall 偏低。")
+            suggestions += ["使用残差式门控", "减弱可靠性门控抑制", "给目标帧加入 target_project", "给最终 prompt 残差增加可学习 gamma"]
+        elif gate_mean > 0.85:
+            lines.append("门控可能过弱或几乎不起作用，可能无法筛选不可靠跨帧响应。")
+        elif 0.35 <= gate_mean <= 0.75:
+            lines.append("门控强度相对合理。")
+        else:
+            lines.append("门控强度处于中间过渡区，需要结合 Recall 和 Pred/GT 比例判断。")
+        if not math.isnan(gate_std) and gate_std < 0.05:
+            lines.append("gate_std 很低，门控缺乏空间区分性。")
+    lines.append("")
+
+    lines.append("## 7. Efficiency Diagnosis")
+    lines.append(f"参数量 {params_m:.2f}M，平均 epoch 时间 {avg_epoch_time:.2f}s，最后 epoch 吞吐 {fmt_metric(last['samples_per_sec'])} samples/s。")
+    lines.append(f"最大显存占用 {max_memory:.1f} MB。")
+    if max_memory > 14 * 1024:
+        lines.append("显存占用接近 RTX 5060 Ti 16GB 上限，建议降低 batch size 或开启 checkpointing。")
+        suggestions += ["降低 batch size", "开启 gradient checkpointing", "检查 Transformer 或时序模块显存占用"]
+    lines.append("")
+
+    lines.append("## 8. Suggested Improvements")
+    if not suggestions:
+        suggestions = ["当前诊断未发现单一突出缺陷，建议优先查看预测可视化和边界误差样本。"]
+    for item in dict.fromkeys(suggestions):
+        lines.append(f"- {item}")
+    lines.append("")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 class DiceLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -267,6 +707,7 @@ class BaselineLossWrapper(nn.Module):
         super().__init__()
         self.criterion_bce = LabelSmoothingBCE(pos_weight=pos_weight, smoothing=smoothing)
         self.criterion_dice = DiceLoss()
+        self.aux_weights = [0.4, 0.2, 0.1]
 
     def _calc_single(self, pred, target):
         if pred.shape[-2:] != target.shape[-2:]:
@@ -284,8 +725,9 @@ class BaselineLossWrapper(nn.Module):
 
         # 提取辅助头预测 (Deep Supervision)
         if 'aux' in outputs:
-            for aux_pred in outputs['aux']:
-                loss += 0.5 * self._calc_single(aux_pred, targets)
+            for i, aux_pred in enumerate(outputs['aux']):
+                w = self.aux_weights[i] if i < len(self.aux_weights) else 0.1
+                loss += w * self._calc_single(aux_pred, targets)
 
         return loss
 
@@ -293,8 +735,11 @@ def compute_all_metrics(logits, targets, threshold=0.5, eps=1e-7):
     """
     全量论文指标计算 (Dice, IoU, Recall, Precision, Specificity)
     """
+    if logits.shape[-2:] != targets.shape[-2:]:
+        logits = F.interpolate(logits, size=targets.shape[-2:], mode='bilinear', align_corners=False)
     probs = torch.sigmoid(logits)
     preds = (probs > threshold).float()
+    targets = targets.float()
 
     tp = (preds * targets).sum()
     fp = (preds * (1 - targets)).sum()
@@ -306,13 +751,27 @@ def compute_all_metrics(logits, targets, threshold=0.5, eps=1e-7):
     recall = (tp + eps) / (tp + fn + eps)  # Sensitivity (敏感度)
     precision = (tp + eps) / (tp + fp + eps)  # PPV
     specificity = (tn + eps) / (tn + fp + eps)  # 特异度 (防误诊)
+    fpr = fp / (fp + tn + eps)
+    fnr = fn / (fn + tp + eps)
+    pred_fg_ratio = preds.sum() / (preds.numel() + eps)
+    gt_fg_ratio = targets.sum() / (targets.numel() + eps)
+    pred_gt_fg_ratio = pred_fg_ratio / (gt_fg_ratio + eps)
 
     return {
-        "dice": dice.item(),
-        "iou": iou.item(),
-        "recall": recall.item(),
-        "precision": precision.item(),
-        "specificity": specificity.item()
+        "dice": float(dice.item()),
+        "iou": float(iou.item()),
+        "recall": float(recall.item()),
+        "precision": float(precision.item()),
+        "specificity": float(specificity.item()),
+        "fpr": float(fpr.item()),
+        "fnr": float(fnr.item()),
+        "pred_fg_ratio": float(pred_fg_ratio.item()),
+        "gt_fg_ratio": float(gt_fg_ratio.item()),
+        "pred_gt_fg_ratio": float(pred_gt_fg_ratio.item()),
+        "TP": float(tp.item()),
+        "FP": float(fp.item()),
+        "FN": float(fn.item()),
+        "TN": float(tn.item()),
     }
 
 
@@ -321,9 +780,15 @@ def train_one_epoch(model, dataloader, optimizer, criterion,
                     accumulation_steps=1):
     model.train()
     total_loss = 0.0
-    metrics_keys = ["dice", "iou", "recall", "precision", "specificity"]
+    metrics_keys = [
+        "dice", "iou", "recall", "precision", "specificity",
+        "fpr", "fnr", "pred_fg_ratio", "gt_fg_ratio", "pred_gt_fg_ratio",
+        "TP", "FP", "FN", "TN",
+    ]
     total_metrics = {k: 0.0 for k in metrics_keys}
     n_batches = len(dataloader)
+    grad_norm_total = 0.0
+    grad_norm_steps = 0
     optimizer.zero_grad()
 
     pbar = tqdm(dataloader, desc=f"Train [{epoch}/{total_epochs}]", ncols=110)
@@ -352,12 +817,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion,
         if (i + 1) % accumulation_steps == 0 or (i + 1) == n_batches:
             if use_amp and scaler:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+            grad_norm_total += as_float(grad_norm, 0.0)
+            grad_norm_steps += 1
             optimizer.zero_grad()
 
         current_loss_val = loss.item() * accumulation_steps
@@ -374,47 +841,79 @@ def train_one_epoch(model, dataloader, optimizer, criterion,
 
     avg_loss = total_loss / n_batches
     for k in total_metrics: total_metrics[k] /= n_batches
+    total_metrics["grad_norm"] = grad_norm_total / max(grad_norm_steps, 1)
     return avg_loss, total_metrics
 
 
 def validate_one_epoch(model, dataloader,criterion,device,
-                       epoch, total_epochs, use_amp=False):
+                       epoch, total_epochs, use_amp=False,
+                       compute_hd95=False, hd95_threshold=0.5):
     model.eval()
+    old_return_diagnostics = getattr(model, "return_diagnostics", False)
+    if hasattr(model, "return_diagnostics"):
+        model.return_diagnostics = True
     total_loss = 0.0
-    metrics_keys = ["dice", "iou", "recall", "precision", "specificity"]
+    metrics_keys = [
+        "dice", "iou", "recall", "precision", "specificity",
+        "fpr", "fnr", "pred_fg_ratio", "gt_fg_ratio", "pred_gt_fg_ratio",
+        "TP", "FP", "FN", "TN",
+    ]
     total_metrics = {k: 0.0 for k in metrics_keys}
+    optional_keys = [
+        "gate_mean", "gate_std", "gate_min", "gate_max",
+        "prompt_norm", "target_feat_norm", "merged_state_norm", "prompt_target_ratio",
+    ]
+    optional_totals = {k: 0.0 for k in optional_keys}
+    optional_counts = {k: 0 for k in optional_keys}
+    hd95_values = []
     n_batches = len(dataloader)
 
     pbar = tqdm(dataloader, desc=f"Val   [{epoch}/{total_epochs}]", ncols=110)
-    with torch.no_grad():
-        for batch in pbar:
-            if batch is None: continue
+    try:
+        with torch.no_grad():
+            for batch in pbar:
+                if batch is None: continue
 
-            seq_imgs, masks = batch
-            seq_imgs = seq_imgs.to(device)
-            masks = masks.to(device)
+                seq_imgs, masks = batch
+                seq_imgs = seq_imgs.to(device)
+                masks = masks.to(device)
 
-            with autocast('cuda', enabled=use_amp):
-                outputs = model(seq_imgs)
-                loss = criterion(outputs, masks)
+                with autocast('cuda', enabled=use_amp):
+                    outputs = model(seq_imgs)
+                    loss = criterion(outputs, masks)
 
-            pred_for_metric = outputs['seg'] if isinstance(outputs, dict) else outputs
-            total_loss += loss.item()
+                pred_for_metric = outputs['seg'] if isinstance(outputs, dict) else outputs
+                total_loss += loss.item()
 
-            if pred_for_metric.shape[-2:] != masks.shape[-2:]:
-                pred_for_metric = F.interpolate(pred_for_metric, size=masks.shape[-2:], mode='bilinear',
-                                                align_corners=False)
+                if pred_for_metric.shape[-2:] != masks.shape[-2:]:
+                    pred_for_metric = F.interpolate(pred_for_metric, size=masks.shape[-2:], mode='bilinear',
+                                                    align_corners=False)
 
-            m = compute_all_metrics(pred_for_metric, masks, threshold=0.5)
-            for k in total_metrics: total_metrics[k] += m[k]
+                m = compute_all_metrics(pred_for_metric, masks, threshold=0.5)
+                for k in total_metrics: total_metrics[k] += m[k]
+                opt_stats = collect_output_diagnostics(outputs)
+                for k, v in opt_stats.items():
+                    if not math.isnan(v):
+                        optional_totals[k] += v
+                        optional_counts[k] += 1
+                if compute_hd95:
+                    hd95 = compute_batch_hd95(pred_for_metric, masks, threshold=hd95_threshold)
+                    if not math.isnan(hd95):
+                        hd95_values.append(hd95)
 
-            pbar.set_postfix(loss=f"{loss.item():.3f}", d=f"{m['dice']:.3f}", r=f"{m['recall']:.3f}")
+                pbar.set_postfix(loss=f"{loss.item():.3f}", d=f"{m['dice']:.3f}", r=f"{m['recall']:.3f}")
+    finally:
+        if hasattr(model, "return_diagnostics"):
+            model.return_diagnostics = old_return_diagnostics
 
     if n_batches > 0:
         avg_loss = total_loss / n_batches
         for k in total_metrics: total_metrics[k] /= n_batches
     else:
         avg_loss, total_metrics = 0.0, {k: 0.0 for k in metrics_keys}
+    for k in optional_keys:
+        total_metrics[k] = optional_totals[k] / optional_counts[k] if optional_counts[k] > 0 else nan_value()
+    total_metrics["hd95"] = float(np.mean(hd95_values)) if hd95_values else nan_value()
 
     return avg_loss, total_metrics
 
@@ -461,7 +960,7 @@ def main(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     pos_w = torch.tensor([args.pos_weight if args.pos_weight else 1.0], device=device)
-    loss_type = 'DiceLoss+LabelSmoothingBCE'
+    loss_type = 'DiceLoss+LabelSmoothingBCE(aux=[0.4,0.2,0.1])'
     print(f">>> [Info] Using Baseline Loss ({loss_type})")
     criterion = BaselineLossWrapper(pos_weight=pos_w, smoothing=0.1).to(device)
 
@@ -474,65 +973,120 @@ def main(args):
             model.load_state_dict(sd, strict=False)
             log_to_file(log_path, f"Loaded weights from {cp}")
 
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=args.epochs, min_lr=1e-5)
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=args.epochs, min_lr=1e-6)
     early_stopper = ImprovedEarlyStopping(patience=args.early_stopping)
     visualizer = TrainingVisualizer(args.save_dir)
+    total_params, trainable_params = count_parameters(model)
+    diagnostics_logger = None
+    if args.enable_diagnostics:
+        diagnostics_dir = args.diagnostics_dir or os.path.join(args.save_dir, "diagnostics")
+        diagnostics_logger = TrainingDiagnosticsLogger(
+            diagnostics_dir=diagnostics_dir,
+            args=args,
+            model=model,
+            device=device,
+            params_m=total_params / 1e6,
+            trainable_params_m=trainable_params / 1e6,
+            flops_g=nan_value(),
+        )
+        if args.compute_hd95 and (binary_erosion is None or distance_transform_edt is None):
+            log_to_file(log_path, "[Diagnostics] scipy is unavailable; HD95 will be written as N/A.")
 
     # 记录最佳权重的变量
     best_val_dice = -1.0
     best_val_recall = -1.0
 
-    for epoch in range(1, args.epochs + 1):
-        if should_freeze and epoch == 51:
-            log_to_file(log_path, f"\n>>> [Epoch {epoch}] Unfreezing All Layers... Start Fine-tuning! <<<")
-            for param in model.parameters(): param.requires_grad = True
+    try:
+        for epoch in range(1, args.epochs + 1):
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            epoch_start = time.time()
+            if should_freeze and epoch == 51:
+                log_to_file(log_path, f"\n>>> [Epoch {epoch}] Unfreezing All Layers... Start Fine-tuning! <<<")
+                for param in model.parameters(): param.requires_grad = True
 
-        t_loss, t_metrics = train_one_epoch(
-            model, train_loader, optimizer, criterion,
-            device, epoch, args.epochs, scaler, use_amp, accumulation_steps=args.accumulation_steps
-        )
+            train_start = time.time()
+            t_loss, t_metrics = train_one_epoch(
+                model, train_loader, optimizer, criterion,
+                device, epoch, args.epochs, scaler, use_amp, accumulation_steps=args.accumulation_steps
+            )
+            train_time = time.time() - train_start
 
-        v_loss, v_metrics = validate_one_epoch(
-            model, val_loader, criterion, device,
-            epoch, args.epochs, use_amp
-        )
+            val_start = time.time()
+            should_compute_hd95 = bool(args.compute_hd95) and (epoch % max(args.hd95_every, 1) == 0)
+            v_loss, v_metrics = validate_one_epoch(
+                model, val_loader, criterion, device,
+                epoch, args.epochs, use_amp,
+                compute_hd95=should_compute_hd95
+            )
+            val_time = time.time() - val_start
+            epoch_time = time.time() - epoch_start
 
-        t_metrics['loss'] = t_loss
-        v_metrics['loss'] = v_loss
+            t_metrics['loss'] = t_loss
+            v_metrics['loss'] = v_loss
 
-        scheduler.step()
-        curr_lr = scheduler.get_last_lr()[0]
-        visualizer.update(epoch, t_metrics, v_metrics, curr_lr)
+            scheduler.step()
+            curr_lr = scheduler.get_last_lr()[0]
+            visualizer.update(epoch, t_metrics, v_metrics, curr_lr)
 
-        # 日志写入
-        log_msg = (f"Epoch {epoch}/{args.epochs} (LR: {curr_lr:.6f}):\n"
-                   f"  Train - Loss: {t_loss:.4f} | Dice: {t_metrics['dice']:.4f} | Recall: {t_metrics['recall']:.4f} | Spec: {t_metrics['specificity']:.4f}\n"
-                   f"  Val   - Loss: {v_loss:.4f} | Dice: {v_metrics['dice']:.4f} | Recall: {v_metrics['recall']:.4f} | Spec: {v_metrics['specificity']:.4f}")
-        log_to_file(log_path, log_msg)
+            samples_per_sec = len(train_dataset) / max(train_time, 1e-7)
+            max_gpu_memory_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
+            timing = {
+                "epoch_time_sec": epoch_time,
+                "train_time_sec": train_time,
+                "val_time_sec": val_time,
+                "samples_per_sec": samples_per_sec,
+                "max_gpu_memory_mb": max_gpu_memory_mb,
+            }
+            if diagnostics_logger:
+                diagnostics_logger.log_epoch(epoch, curr_lr, t_metrics, v_metrics, timing)
 
-        torch.save(model.state_dict(), os.path.join(args.save_dir, "last.pth"))
+            bdf_line = ""
+            if not math.isnan(v_metrics.get("gate_mean", nan_value())):
+                bdf_line = (
+                    f"\n  BDF   - gate_mean: {fmt_metric(v_metrics.get('gate_mean'))} | "
+                    f"gate_std: {fmt_metric(v_metrics.get('gate_std'))}"
+                )
+            log_msg = (
+                f"Epoch {epoch}/{args.epochs} (LR: {curr_lr:.6f}):\n"
+                f"  Train - Loss: {t_loss:.4f} | Dice: {t_metrics['dice']:.4f} | IoU: {t_metrics['iou']:.4f} | "
+                f"Precision: {t_metrics['precision']:.4f} | Recall: {t_metrics['recall']:.4f} | Spec: {t_metrics['specificity']:.4f}\n"
+                f"  Val   - Loss: {v_loss:.4f} | Dice: {v_metrics['dice']:.4f} | IoU: {v_metrics['iou']:.4f} | "
+                f"Precision: {v_metrics['precision']:.4f} | Recall: {v_metrics['recall']:.4f} | Spec: {v_metrics['specificity']:.4f} | "
+                f"FPR: {fmt_metric(v_metrics.get('fpr'))} | FNR: {fmt_metric(v_metrics.get('fnr'))} | "
+                f"Pred/GT: {fmt_metric(v_metrics.get('pred_gt_fg_ratio'))}\n"
+                f"  Diag  - Gap(Dice): {fmt_metric(t_metrics['dice'] - v_metrics['dice'])} | "
+                f"HD95: {fmt_metric(v_metrics.get('hd95'))} | GPU: {max_gpu_memory_mb:.1f} MB | Time: {epoch_time:.1f} s"
+                f"{bdf_line}"
+            )
+            log_to_file(log_path, log_msg)
 
-        # 1. 保存最高 Dice 权重 (总体分割最佳)
-        if v_metrics['dice'] > best_val_dice:
-            best_val_dice = v_metrics['dice']
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "best_dice.pth"))
-            log_to_file(log_path, f"  [!] New Best Dice Saved: {best_val_dice:.4f}")
+            torch.save(model.state_dict(), os.path.join(args.save_dir, "last.pth"))
 
-        # 2. 保存最高 Recall 权重 (医学早期筛查极具价值)
-        if v_metrics['recall'] > best_val_recall:
-            best_val_recall = v_metrics['recall']
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "best_recall.pth"))
-            log_to_file(log_path, f"  [!] New Best Recall Saved: {best_val_recall:.4f}")
+            # 1. 保存最高 Dice 权重 (总体分割最佳)
+            if v_metrics['dice'] > best_val_dice:
+                best_val_dice = v_metrics['dice']
+                torch.save(model.state_dict(), os.path.join(args.save_dir, "best_dice.pth"))
+                log_to_file(log_path, f"  [!] New Best Dice Saved: {best_val_dice:.4f}")
 
-        if early_stopper(v_metrics, epoch, model):
-            log_to_file(log_path, f"Early stopping at epoch {epoch}")
-            break
+            # 2. 保存最高 Recall 权重 (医学早期筛查极具价值)
+            if v_metrics['recall'] > best_val_recall:
+                best_val_recall = v_metrics['recall']
+                torch.save(model.state_dict(), os.path.join(args.save_dir, "best_recall.pth"))
+                log_to_file(log_path, f"  [!] New Best Recall Saved: {best_val_recall:.4f}")
 
-        gc.collect()
-        torch.cuda.empty_cache()
+            if early_stopper(v_metrics, epoch, model):
+                log_to_file(log_path, f"Early stopping at epoch {epoch}")
+                break
 
-    visualizer.plot(best_epoch=early_stopper.best_epoch)
-    log_to_file(log_path, "Training Finished.")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    finally:
+        visualizer.plot(best_epoch=early_stopper.best_epoch)
+        if diagnostics_logger:
+            diagnostics_logger.finalize()
+        log_to_file(log_path, "Training Finished.")
 
 
 if __name__ == "__main__":
@@ -541,7 +1095,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_dir", type=str, default=r"D:\datasets\pmtm\TBUT_Seg_Data_v1\val")
     parser.add_argument("--save_dir", type=str, default="./runs/st_unet_exp")
 
-    parser.add_argument("--window_size", type=int, default=3)
+    parser.add_argument("--window_size", type=int, default=5)
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--use_polar", type=bool, default=False)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -556,6 +1110,10 @@ if __name__ == "__main__":
     parser.add_argument("--early_stopping", type=int, default=30)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
+    parser.add_argument("--enable_diagnostics", action="store_true", default=True)
+    parser.add_argument("--compute_hd95", action="store_true", default=False)
+    parser.add_argument("--hd95_every", type=int, default=1)
+    parser.add_argument("--diagnostics_dir", type=str, default=None)
 
     parser.add_argument("--net_name", type=str, default='xxx')
 

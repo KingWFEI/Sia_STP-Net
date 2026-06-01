@@ -60,6 +60,10 @@ def build_loaders(cfg, batch_size=None):
     batch_size = int(batch_size or train_cfg["batch_size"])
     num_workers = int(train_cfg.get("num_workers", 4))
     pin_memory = torch.cuda.is_available()
+    test_dir = data_cfg.get("test_dir")
+    if not test_dir or not os.path.exists(test_dir):
+        test_dir = data_cfg["val_dir"]
+        print(f"[Data] test_dir is not set or does not exist. Using val_dir for final evaluation: {test_dir}")
 
     train_dataset = SequencePMTMDataset(
         root_dir=data_cfg["train_dir"],
@@ -76,7 +80,7 @@ def build_loaders(cfg, batch_size=None):
         is_train=False,
     )
     test_dataset = SequencePMTMDataset(
-        root_dir=data_cfg["test_dir"],
+        root_dir=test_dir,
         window_size=int(data_cfg["window_size"]),
         img_size=int(data_cfg["img_size"]),
         use_polar=bool(data_cfg.get("use_polar", False)),

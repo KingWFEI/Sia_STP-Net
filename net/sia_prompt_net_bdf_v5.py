@@ -5,13 +5,19 @@ from net.sia_prompt_net_bdf import STNFeatureAligner
 from net.sia_prompt_net_bdf import SiameseSTPromptNet as BaseSiameseSTPromptNet
 
 
-class BiGatedDifferenceFusionV2(nn.Module):
-    """BDF-v2: use a reliability floor to keep weak temporal evidence active."""
+class BiGatedDifferenceFusionV5(nn.Module):
+    """BDF-v5: v4 temporal residual plus target-frame evidence projection."""
 
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
         self.aligner = STNFeatureAligner(channels)
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.target_project = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=16, num_channels=channels),
+            nn.ReLU(inplace=True),
+        )
 
         in_ch = channels * 4 + 1
         self.phi_evidence = nn.Sequential(
@@ -37,6 +43,7 @@ class BiGatedDifferenceFusionV2(nn.Module):
         t_total = len(feature_sequence)
         target_idx = t_total // 2
         feat_target = feature_sequence[target_idx]
+        target_evidence = self.target_project(feat_target)
         norm_factor = max(target_idx, t_total - 1 - target_idx, 1)
 
         aligned_seq = []
@@ -47,11 +54,11 @@ class BiGatedDifferenceFusionV2(nn.Module):
                 aligned_seq.append(self.aligner(feature_sequence[t], feat_target))
 
         e_hat_seq = []
-        gate_maps = []
+        gate_maps_rt = []
         for t in range(t_total):
             if t == target_idx:
-                e_hat_seq.append(feat_target)
-                gate_maps.append(torch.ones((b, 1, h, w), device=feat_target.device, dtype=feat_target.dtype))
+                e_hat_seq.append(target_evidence)
+                gate_maps_rt.append(torch.ones((b, 1, h, w), device=feat_target.device, dtype=feat_target.dtype))
                 continue
 
             feat_t = aligned_seq[t]
@@ -63,8 +70,9 @@ class BiGatedDifferenceFusionV2(nn.Module):
             descriptor = torch.cat([feat_t, feat_target, diff, abs_diff, pe_map], dim=1)
             e_t = self.phi_evidence(descriptor)
             r_t = torch.sigmoid(self.psi_reliability(e_t))
-            e_hat_seq.append((0.5 + 0.5 * r_t) * e_t)
-            gate_maps.append(r_t)
+            e_hat_t = (0.5 + 0.5 * r_t) * e_t
+            e_hat_seq.append(e_hat_t)
+            gate_maps_rt.append(r_t)
 
         s_fwd = torch.zeros_like(feat_target)
         s_bwd = torch.zeros_like(feat_target)
@@ -84,23 +92,25 @@ class BiGatedDifferenceFusionV2(nn.Module):
             s_bwd_list[t] = s_bwd
 
         merged_state = self.fusion_project(torch.cat([s_fwd_list[target_idx], s_bwd_list[target_idx]], dim=1))
+        gamma = torch.sigmoid(self.gamma)
+        prompt = feat_target + gamma * merged_state
+
         return {
-            "prompt": merged_state + feat_target,
-            "gate_maps": torch.stack(gate_maps, dim=1),
-            "target_feat": feat_target,
-            "merged_state": merged_state,
+            "prompt": prompt,
+            "gate_maps": torch.stack(gate_maps_rt, dim=1),
+            "aligned_seq": torch.stack(aligned_seq, dim=1),
         }
 
 
-class SiameseSTPromptNetBDFV2(BaseSiameseSTPromptNet):
+class SiameseSTPromptNetBDFV5(BaseSiameseSTPromptNet):
     def __init__(self, num_classes, input_channels=1, deep_supervision=True):
         super().__init__(num_classes=num_classes, input_channels=input_channels, deep_supervision=deep_supervision)
-        self.st_fusion_bottleneck = BiGatedDifferenceFusionV2(512)
+        self.st_fusion_bottleneck = BiGatedDifferenceFusionV5(512)
 
 
 def build_model(window_size=5, image_size=(512, 512), num_classes=1, input_channels=1):
-    print(f"[Model] Building Siamese ST-Prompt-Net BDF-v2 | Window: {window_size}, Input: {image_size}")
-    return SiameseSTPromptNetBDFV2(
+    print(f"[Model] Building Siamese ST-Prompt-Net BDF-v5 | Window: {window_size}, Input: {image_size}")
+    return SiameseSTPromptNetBDFV5(
         num_classes=num_classes,
         input_channels=input_channels,
         deep_supervision=True,

@@ -88,6 +88,8 @@ class BiGatedDifferenceFusionV4(nn.Module):
         return {
             "prompt": feat_target + self.gamma * merged_state,
             "gate_maps": torch.stack(gate_maps, dim=1),
+            "target_feat": feat_target,
+            "merged_state": merged_state,
         }
 
 
@@ -104,4 +106,3 @@ def build_model(window_size=5, image_size=(512, 512), num_classes=1, input_chann
         input_channels=input_channels,
         deep_supervision=True,
     )
-

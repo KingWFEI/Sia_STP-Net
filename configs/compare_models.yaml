@@ -4,7 +4,7 @@ output_dir: run/comparison
 data:
   train_dir: D:\datasets\pmtm\TBUT_Seg_Data_v1\train
   val_dir: D:\datasets\pmtm\TBUT_Seg_Data_v1\val
-  test_dir: D:\datasets\pmtm\TBUT_Seg_Data_v1\test
+  test_dir:
   window_size: 5
   input_channels: 1
   img_size: 512
@@ -72,4 +72,3 @@ models:
   siamese_stpnet:
     type: temporal
     display_name: Siamese STP-Net
-

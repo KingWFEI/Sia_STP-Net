@@ -208,7 +208,9 @@ class BiGatedDifferenceFusion(nn.Module):
 
         return {
             "prompt": P_c,
-            "gate_maps": torch.stack(gate_maps_rt, dim=1)   # [B, T, 1, H, W]，仅调试/可视化备用
+            "gate_maps": torch.stack(gate_maps_rt, dim=1),   # [B, T, 1, H, W]，仅调试/可视化备用
+            "target_feat": feat_target,
+            "merged_state": merged_state,
         }
 # =========================================================================
 #  4. 时空动态提示词核心组件 (Temporal-Prompted Decoder Modules)
@@ -261,6 +263,7 @@ class SiameseSTPromptNet(nn.Module):
     def __init__(self, num_classes, input_channels=1, deep_supervision=True):
         super().__init__()
         self.deep_supervision = deep_supervision
+        self.return_diagnostics = False
         nb_filter = [32, 64, 128, 256, 512]
 
         # 1. 孪生静态细节编码器
@@ -359,13 +362,17 @@ class SiameseSTPromptNet(nn.Module):
 
         output = self.final(d0)
 
-        if self.training:
+        if self.training or self.return_diagnostics:
             out_dict = {
                 "seg": output,
-                "gate_maps": gate_maps  # 可留可不留，只做调试
+                "gate_maps": gate_maps,  # 可留可不留，只做调试
+                "prompt": temporal_prompt_4,
+                "target_feat": bottleneck_out.get("target_feat"),
+                "merged_state": bottleneck_out.get("merged_state"),
+                "aligned_seq": bottleneck_out.get("aligned_seq"),
             }
 
-            if self.deep_supervision:
+            if self.training and self.deep_supervision:
                 target_size = output.shape[2:]
                 aux1 = F.interpolate(self.final1(d1), size=target_size, mode='bilinear', align_corners=True)
                 aux2 = F.interpolate(self.final2(d2), size=target_size, mode='bilinear', align_corners=True)
