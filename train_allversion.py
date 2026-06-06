@@ -19,6 +19,11 @@ BDF_VARIANTS = {
         "display": "BDF-v1",
         "desc": "baseline: e_hat_t = r_t * e_t",
     },
+    "v1_1": {
+        "module": "net.sia_prompt_net_bdf_v1_1",
+        "display": "BDF-v1-1",
+        "desc": "v1 + shallow reliability-gated skip",
+    },
     "v2": {
         "module": "net.sia_prompt_net_bdf_v2",
         "display": "BDF-v2",
@@ -83,6 +88,7 @@ def parse_args():
     parser.add_argument("--val_dir", type=str, default=r"D:\datasets\pmtm\TBUT_Seg_Data_v1\val")
     parser.add_argument("--base_save_dir", type=str, default="./runs/bdf_all_versions")
     parser.add_argument("--versions", nargs="+", default=["v1", "v2", "v3", "v4", "v5"], choices=list(BDF_VARIANTS))
+    parser.add_argument("--version", dest="versions", nargs="+", choices=list(BDF_VARIANTS), default=argparse.SUPPRESS)
 
     parser.add_argument("--window_size", type=int, default=5)
     parser.add_argument("--img_size", type=int, default=512)
